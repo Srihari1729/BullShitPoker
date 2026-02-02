@@ -37,6 +37,12 @@ const HAND_RANKINGS = [
   { name: 'Royal Flush', value: 10 }
 ];
 
+const BOT_NAMES = [
+  'Dealer', 'Raven', 'Ace', 'Bluff', 'Switch', 'Nova', 'Cipher', 'Joker', 'Spade', 'Lucky'
+];
+
+const DEFAULT_TURN_TIME_SECONDS = 120;
+
 export default function BullshitPoker() {
   console.log("♠️ Bullshit Poker Loaded - Version: v2.3 (" + new Date().toISOString() + ")");
   const [screen, setScreen] = useState('home');
@@ -56,11 +62,15 @@ export default function BullshitPoker() {
   const [showAvatarPopup, setShowAvatarPopup] = useState(false);
   const [showClaimModal, setShowClaimModal] = useState(false); // New state for claim popup
   const [isMaximized, setIsMaximized] = useState(false); // Smart Fullscreen/Rotation Toggle
+  const [turnTimeSeconds, setTurnTimeSeconds] = useState(120);
   
   // Track the last result timestamp to prevent re-showing
   const lastResultTimestamp = useRef(0);
   // Track if modal was manually closed for current result
   const closedResultTimestamp = useRef(0);
+  const timeoutInProgressRef = useRef(false);
+  const botActionRef = useRef(null);
+  const gameStateRef = useRef(null);
 
   // New Helper: Verify Deck Uniqueness
   const verifyUniqueDeck = (deck) => {
@@ -84,6 +94,16 @@ export default function BullshitPoker() {
         setShowRoundResult(true);
       }
     }
+  }, [gameState]);
+
+  useEffect(() => {
+    if (screen !== 'home') {
+      setError('');
+    }
+  }, [screen]);
+
+  useEffect(() => {
+    gameStateRef.current = gameState;
   }, [gameState]);
 
   // Handle closing the modal
@@ -112,6 +132,135 @@ export default function BullshitPoker() {
 
   const generatePIN = () => {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
+  };
+
+  const createFullDeck = () => {
+    const deck = [];
+    for (let suit of SUITS) {
+      for (let rank of RANKS) {
+        deck.push({ rank, suit, id: `${rank}${suit}` });
+      }
+    }
+    return deck;
+  };
+
+  const getHandValue = (handName) => {
+    return HAND_RANKINGS.find(h => h.name === handName)?.value || 0;
+  };
+
+  const isClaimHigher = (claim, prevClaim) => {
+    if (!prevClaim) return true;
+    if (claim.handValue > prevClaim.handValue) return true;
+    if (claim.handValue < prevClaim.handValue) return false;
+
+    if (claim.hand === 'Flush') {
+      return RANK_VALUES[claim.rank] < RANK_VALUES[prevClaim.rank];
+    }
+    if (claim.hand === 'Straight' || claim.hand === 'Straight Flush') {
+      return RANK_VALUES[claim.rank] > RANK_VALUES[prevClaim.rank];
+    }
+    if (claim.hand === 'Royal Flush') {
+      return false;
+    }
+    return RANK_VALUES[claim.rank] > RANK_VALUES[prevClaim.rank];
+  };
+
+  const buildAllClaims = () => {
+    const claims = [];
+
+    // High Card, Pair, Three, Four
+    ['High Card', 'Pair', 'Three of a Kind', 'Four of a Kind'].forEach(hand => {
+      RANKS.forEach(rank => {
+        claims.push({ hand, handValue: getHandValue(hand), rank, rank2: null, suit: null });
+      });
+    });
+
+    // Two Pair (rank = higher pair)
+    for (let i = 0; i < RANKS.length; i++) {
+      for (let j = i + 1; j < RANKS.length; j++) {
+        const r1 = RANKS[i];
+        const r2 = RANKS[j];
+        const rankValue1 = RANK_VALUES[r1];
+        const rankValue2 = RANK_VALUES[r2];
+        const high = rankValue1 >= rankValue2 ? r1 : r2;
+        const low = high === r1 ? r2 : r1;
+        claims.push({ hand: 'Two Pair', handValue: getHandValue('Two Pair'), rank: high, rank2: low, suit: null });
+      }
+    }
+
+    // Full House (rank = triplet)
+    for (let i = 0; i < RANKS.length; i++) {
+      for (let j = 0; j < RANKS.length; j++) {
+        if (i === j) continue;
+        claims.push({ hand: 'Full House', handValue: getHandValue('Full House'), rank: RANKS[i], rank2: RANKS[j], suit: null });
+      }
+    }
+
+    // Straight (high card 5 to A)
+    Object.entries(RANK_VALUES).forEach(([rank, value]) => {
+      if (value >= 5) {
+        claims.push({ hand: 'Straight', handValue: getHandValue('Straight'), rank, rank2: null, suit: null });
+      }
+    });
+
+    // Flush
+    SUITS.forEach(suit => {
+      RANKS.forEach(rank => {
+        claims.push({ hand: 'Flush', handValue: getHandValue('Flush'), rank, rank2: null, suit });
+      });
+    });
+
+    // Straight Flush
+    SUITS.forEach(suit => {
+      Object.entries(RANK_VALUES).forEach(([rank, value]) => {
+        if (value >= 5) {
+          claims.push({ hand: 'Straight Flush', handValue: getHandValue('Straight Flush'), rank, rank2: null, suit });
+        }
+      });
+    });
+
+    // Royal Flush
+    SUITS.forEach(suit => {
+      claims.push({ hand: 'Royal Flush', handValue: getHandValue('Royal Flush'), rank: 'A', rank2: null, suit });
+    });
+
+    return claims;
+  };
+
+  const allClaimsRef = useRef(null);
+  if (!allClaimsRef.current) {
+    allClaimsRef.current = buildAllClaims();
+  }
+
+  const sampleCards = (deck, count) => {
+    if (count <= 0) return [];
+    const copy = deck.slice();
+    for (let i = copy.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [copy[i], copy[j]] = [copy[j], copy[i]];
+    }
+    return copy.slice(0, count);
+  };
+
+  const estimateClaimProbability = (claim, botCards, totalCards, samples = 120) => {
+    const unknownCount = Math.max(0, totalCards - botCards.length);
+    if (unknownCount === 0) {
+      return checkClaim(claim, botCards) ? 1 : 0;
+    }
+
+    const fullDeck = createFullDeck();
+    const botIds = new Set(botCards.map(card => card.id));
+    const remainingDeck = fullDeck.filter(card => !botIds.has(card.id));
+    if (unknownCount > remainingDeck.length) return 0;
+
+    let trueCount = 0;
+    for (let i = 0; i < samples; i++) {
+      const sampled = sampleCards(remainingDeck, unknownCount);
+      const hypothetical = botCards.concat(sampled);
+      if (checkClaim(claim, hypothetical)) trueCount += 1;
+    }
+
+    return trueCount / samples;
   };
 
   const checkClaim = (claim, allCards) => {
@@ -212,6 +361,13 @@ export default function BullshitPoker() {
     return allCards.map(card => `${card.rank}${card.suit}`).join(', ');
   };
 
+  const formatTime = (totalSeconds) => {
+    const safe = Math.max(0, Math.floor(totalSeconds));
+    const minutes = Math.floor(safe / 60);
+    const seconds = safe % 60;
+    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+  };
+
   // Firebase Realtime Listener
   useEffect(() => {
     if (gamePin) {
@@ -269,22 +425,16 @@ export default function BullshitPoker() {
       return;
     }
     
-    // Secret Rule: Must start with "host-"
-    if (!playerName.startsWith('host-')) {
-      setError('Only authorized hosts (host-Name) can create games');
-      return;
-    }
-
     const pin = generatePIN();
     const id = Date.now().toString() + '-' + Math.random().toString(36).substring(2, 15);
-    
-    // Strip the secret prefix for the display name
-    const finalName = playerName.substring(5).trim();
+    const finalName = playerName.trim();
 
     const newGame = {
       createdAt: Date.now(),
       pin,
       // password: gamePassword.trim(), // Removed
+      turnTimeSeconds: turnTimeSeconds || DEFAULT_TURN_TIME_SECONDS,
+      turnStartedAt: null,
       players: [{
         id,
         name: finalName,
@@ -313,10 +463,19 @@ export default function BullshitPoker() {
       setGamePin(pin);
       setPlayerId(id);
       setGameState(newGame);
+      setTurnTimeSeconds(newGame.turnTimeSeconds);
       setScreen('lobby');
     } catch (e) {
       console.error(e);
       setError("Could not create game. Check Firebase config.");
+    }
+  };
+
+  const updateTurnTime = async (value) => {
+    const seconds = Number(value) || DEFAULT_TURN_TIME_SECONDS;
+    setTurnTimeSeconds(seconds);
+    if (gameState && playerId === gameState.host && !gameState.started) {
+      await update(ref(db, `rooms/${gamePin}`), { turnTimeSeconds: seconds });
     }
   };
 
@@ -377,6 +536,7 @@ export default function BullshitPoker() {
         setGamePin(pinUpper);
         setPlayerId(newId);
         setGameState(game);
+        setTurnTimeSeconds(game.turnTimeSeconds || DEFAULT_TURN_TIME_SECONDS);
         setScreen(game.started ? 'game' : 'lobby');
         setError('');
         return;
@@ -418,11 +578,59 @@ export default function BullshitPoker() {
       setGamePin(pinUpper);
       setPlayerId(id);
       setGameState(game);
+      setTurnTimeSeconds(game.turnTimeSeconds || DEFAULT_TURN_TIME_SECONDS);
       setScreen('lobby');
       setError('');
     } catch (err) {
       setError('Error joining game: ' + err.message);
     }
+  };
+
+  const addBot = async () => {
+    if (!gameState || gameState.started) return;
+    if (gameState.players.length >= 10) {
+      setError('Game is full (max 10 players)');
+      return;
+    }
+
+    const existingNames = new Set(gameState.players.map(p => p.name.toLowerCase()));
+    const baseName = BOT_NAMES.find(n => !existingNames.has(n.toLowerCase())) || `Bot ${gameState.players.length + 1}`;
+    const botId = `bot-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+
+    const existingAvatarIds = gameState.players.map(p => p.avatarId);
+    const allAvatarIds = Array.from({ length: 10 }, (_, i) => i);
+    const availableAvatarIds = allAvatarIds.filter(id => !existingAvatarIds.includes(id));
+    const avatarId = availableAvatarIds.length > 0
+      ? availableAvatarIds[Math.floor(Math.random() * availableAvatarIds.length)]
+      : Math.floor(Math.random() * 10);
+
+    const botPlayer = {
+      id: botId,
+      name: baseName,
+      avatarId,
+      cards: [],
+      cardCount: 1,
+      eliminated: false,
+      isBot: true
+    };
+
+    const updatedGame = {
+      ...gameState,
+      players: [...gameState.players, botPlayer]
+    };
+
+    await set(ref(db, `rooms/${gamePin}`), updatedGame);
+    setGameState(updatedGame);
+  };
+
+  const removeBot = async (botId) => {
+    if (!gameState || gameState.started) return;
+    const updatedGame = {
+      ...gameState,
+      players: gameState.players.filter(p => p.id !== botId)
+    };
+    await set(ref(db, `rooms/${gamePin}`), updatedGame);
+    setGameState(updatedGame);
   };
 
   const startGame = async () => {
@@ -441,6 +649,7 @@ export default function BullshitPoker() {
       roundActive: true,
       currentPlayer: 0,
       startingPlayer: 0,
+      turnStartedAt: Date.now(),
       allCards: updatedPlayers.map(p => p.cards[0]),
       deck: deck.slice(updatedPlayers.length)
     };
@@ -448,6 +657,30 @@ export default function BullshitPoker() {
     // Firebase: Update game
     await set(ref(db, `rooms/${gamePin}`), updatedGame);
     // await window.storage.set(`game:${gamePin}`, JSON.stringify(updatedGame), true);
+    setGameState(updatedGame);
+  };
+
+  const submitClaim = async (actorId, claim) => {
+    const activePlayers = gameState.players.filter(p => !p.eliminated);
+    const currentIdx = activePlayers.findIndex(p => p.id === actorId);
+    const isStartingPlayer = currentIdx === gameState.startingPlayer;
+
+    if (isStartingPlayer && gameState.currentClaim) {
+      await makeEndingClaim(actorId, claim);
+      return;
+    }
+
+    const nextIdx = (currentIdx + 1) % activePlayers.length;
+
+    const updatedGame = {
+      ...gameState,
+      currentClaim: claim,
+      claimHistory: [...(gameState.claimHistory || []), claim],
+      currentPlayer: nextIdx,
+      turnStartedAt: Date.now()
+    };
+
+    await set(ref(db, `rooms/${gamePin}`), updatedGame);
     setGameState(updatedGame);
   };
 
@@ -529,35 +762,15 @@ export default function BullshitPoker() {
       handValue: selectedHand.value
     };
 
-    const activePlayers = gameState.players.filter(p => !p.eliminated);
-    const currentIdx = activePlayers.findIndex(p => p.id === playerId);
-    const isStartingPlayer = currentIdx === gameState.startingPlayer;
-
-    if (isStartingPlayer && gameState.currentClaim) {
-      await makeEndingClaim(claim);
-    } else {
-      const nextIdx = (currentIdx + 1) % activePlayers.length;
-
-      const updatedGame = {
-        ...gameState,
-        currentClaim: claim,
-        claimHistory: [...(gameState.claimHistory || []), claim],
-        currentPlayer: nextIdx
-      };
-
-      // Firebase update
-      await set(ref(db, `rooms/${gamePin}`), updatedGame);
-      // await window.storage.set(`game:${gamePin}`, JSON.stringify(updatedGame), true);
-      setGameState(updatedGame);
-      setSelectedHand(null);
-      setSelectedRank(null);
-      setSelectedRank2(null);
-      setSelectedSuit(null);
-      setError('');
-    }
+    await submitClaim(playerId, claim);
+    setSelectedHand(null);
+    setSelectedRank(null);
+    setSelectedRank2(null);
+    setSelectedSuit(null);
+    setError('');
   };
 
-  const makeEndingClaim = async (claim) => {
+  const makeEndingClaim = async (actorId, claim) => {
     try {
       const allCards = gameState.allCards;
       const isTrue = checkClaim(claim, allCards);
@@ -571,11 +784,11 @@ export default function BullshitPoker() {
       const actualCount = rankCounts[claim.rank] || 0;
       const actualCount2 = claim.rank2 ? (rankCounts[claim.rank2] || 0) : 0;
 
-      const currentPlayer = gameState.players.find(p => p.id === playerId);
+      const currentPlayer = gameState.players.find(p => p.id === actorId);
 
       if (!isCorrect) {
         const updatedPlayers = gameState.players.map(p => {
-          if (p.id === playerId) {
+          if (p.id === actorId) {
             const newCount = p.cardCount + 1;
             return {
               ...p,
@@ -636,6 +849,7 @@ export default function BullshitPoker() {
           players: nextRoundPlayers,
           currentPlayer: newStartIdx,
           startingPlayer: newStartIdx,
+          turnStartedAt: Date.now(),
           currentClaim: null,
           claimHistory: [],
           roundActive: true,
@@ -682,6 +896,7 @@ export default function BullshitPoker() {
           players: nextRoundPlayers,
           currentPlayer: newStartIdx,
           startingPlayer: newStartIdx,
+          turnStartedAt: Date.now(),
           currentClaim: null,
           claimHistory: [],
           roundActive: true,
@@ -714,7 +929,7 @@ export default function BullshitPoker() {
     }
   };
 
-  const callBullshit = async () => {
+  const callBullshitAs = async (callerId) => {
     try {
       const claim = gameState.currentClaim;
       if (!claim) return;
@@ -731,7 +946,7 @@ export default function BullshitPoker() {
       const actualCount = rankCounts[claim.rank] || 0;
       const actualCount2 = claim.rank2 ? (rankCounts[claim.rank2] || 0) : 0;
 
-      const loser = isLying ? claim.playerId : playerId;
+      const loser = isLying ? claim.playerId : callerId;
       
       const updatedPlayers = gameState.players.map(p => {
         if (p.id === loser) {
@@ -754,7 +969,7 @@ export default function BullshitPoker() {
           winner: active[0].name,
           roundActive: false,
           lastResult: {
-            caller: gameState.players.find(p => p.id === playerId).name,
+            caller: gameState.players.find(p => p.id === callerId).name,
             claim: claim,
             actualDesc: actualDesc,
             actualCount: actualCount,
@@ -793,6 +1008,7 @@ export default function BullshitPoker() {
         players: nextRoundPlayers,
         currentPlayer: newStartIdx,
         startingPlayer: newStartIdx,
+        turnStartedAt: Date.now(),
         currentClaim: null,
         claimHistory: [],
         roundActive: true,
@@ -800,7 +1016,7 @@ export default function BullshitPoker() {
         deck: newDeck.slice(deckIndex),
         deckVersion: Date.now(), // Force UI update
         lastResult: {
-          caller: gameState.players.find(p => p.id === playerId).name,
+          caller: gameState.players.find(p => p.id === callerId).name,
           claim: claim,
           actualDesc: actualDesc,
           actualCount: actualCount,
@@ -820,6 +1036,225 @@ export default function BullshitPoker() {
       setError('Error: ' + err.message);
     }
   };
+
+  const callBullshit = async () => {
+    await callBullshitAs(playerId);
+  };
+
+  const chooseBotAction = (botPlayer) => {
+    const activePlayers = gameState.players.filter(p => !p.eliminated);
+    const totalCards = activePlayers.reduce((sum, p) => sum + p.cardCount, 0);
+    const botCards = botPlayer.cards || [];
+    const prevClaim = gameState.currentClaim;
+    const riskFactor = Math.min(1, (botPlayer.cardCount - 1) / 4);
+
+    if (prevClaim) {
+      const truthProb = estimateClaimProbability(prevClaim, botCards, totalCards, 120);
+      const callThreshold = 0.28 - (riskFactor * 0.08);
+      if (truthProb < callThreshold) {
+        return { type: 'call' };
+      }
+    }
+
+    const candidates = allClaimsRef.current.filter(c => isClaimHigher(c, prevClaim));
+    if (candidates.length === 0) {
+      return prevClaim ? { type: 'call' } : { type: 'claim', claim: null };
+    }
+
+    const safeThreshold = 0.45 + (riskFactor * 0.08);
+    let best = null;
+
+    candidates.forEach((claim) => {
+      const probability = estimateClaimProbability(claim, botCards, totalCards, 120);
+      const rankValue = RANK_VALUES[claim.rank] || 0;
+      let rankPenalty = 0;
+      if (claim.hand === 'Flush') {
+        rankPenalty = (15 - rankValue) * 0.3;
+      } else if (claim.hand === 'Straight' || claim.hand === 'Straight Flush') {
+        rankPenalty = rankValue * 0.25;
+      } else {
+        rankPenalty = rankValue * 0.2;
+      }
+      const score = (probability * 100)
+        - (claim.handValue * 3)
+        - rankPenalty
+        + (Math.random() * 2);
+
+      if (!best || score > best.score) {
+        best = { claim, probability, score };
+      }
+    });
+
+    if (!best) return { type: prevClaim ? 'call' : 'claim', claim: null };
+    if (prevClaim && best.probability < 0.18 && Math.random() < 0.6) {
+      return { type: 'call' };
+    }
+
+    if (best.probability < safeThreshold && prevClaim && Math.random() < 0.3) {
+      return { type: 'call' };
+    }
+
+    return { type: 'claim', claim: best.claim };
+  };
+
+  const performBotTurn = async (botPlayer) => {
+    if (!gameState?.started || gameState?.winner) return;
+    const activePlayers = gameState.players.filter(p => !p.eliminated);
+    const currentActive = activePlayers[gameState.currentPlayer];
+    if (!currentActive || currentActive.id !== botPlayer.id) return;
+
+    const action = chooseBotAction(botPlayer);
+    if (action.type === 'call' && gameState.currentClaim) {
+      await callBullshitAs(botPlayer.id);
+      return;
+    }
+
+    if (!action.claim) return;
+
+    const claim = {
+      ...action.claim,
+      playerId: botPlayer.id,
+      playerName: botPlayer.name
+    };
+
+    await submitClaim(botPlayer.id, claim);
+  };
+
+  const handleTurnTimeout = async () => {
+    try {
+      if (!gameState?.started || gameState?.winner) return;
+
+      const activePlayers = gameState.players.filter(p => !p.eliminated);
+      const currentActive = activePlayers[gameState.currentPlayer];
+      if (!currentActive) return;
+
+      const timeoutPlayerId = currentActive.id;
+      const timeoutPlayerName = currentActive.name;
+
+      const updatedPlayers = gameState.players.map(p => {
+        if (p.id === timeoutPlayerId) {
+          const newCount = p.cardCount + 1;
+          return {
+            ...p,
+            cardCount: newCount,
+            eliminated: newCount > 5
+          };
+        }
+        return p;
+      });
+
+      const activeAfter = updatedPlayers.filter(p => !p.eliminated);
+
+      const lastResult = {
+        timeout: true,
+        reason: 'Time expired',
+        claim: gameState.currentClaim || null,
+        loser: timeoutPlayerName,
+        allCardsInRound: gameState.allCards,
+        timestamp: Date.now()
+      };
+
+      if (activeAfter.length === 1) {
+        const updatedGame = {
+          ...gameState,
+          players: updatedPlayers,
+          winner: activeAfter[0].name,
+          roundActive: false,
+          lastResult
+        };
+        await set(ref(db, `rooms/${gamePin}`), updatedGame);
+        setGameState(updatedGame);
+        return;
+      }
+
+      const newDeck = generateDeck();
+      const newStartIdx = (gameState.startingPlayer + 1) % activeAfter.length;
+
+      let deckIndex = 0;
+      const nextRoundPlayers = updatedPlayers.map(p => {
+        if (p.eliminated) {
+          return { ...p, cards: [] };
+        }
+        const playerCards = newDeck.slice(deckIndex, deckIndex + p.cardCount);
+        deckIndex += p.cardCount;
+        return { ...p, cards: playerCards };
+      });
+
+      const updatedGame = {
+        ...gameState,
+        players: nextRoundPlayers,
+        currentPlayer: newStartIdx,
+        startingPlayer: newStartIdx,
+        turnStartedAt: Date.now(),
+        currentClaim: null,
+        claimHistory: [],
+        roundActive: true,
+        allCards: nextRoundPlayers.filter(p => !p.eliminated).flatMap(p => p.cards),
+        deck: newDeck.slice(deckIndex),
+        deckVersion: Date.now(),
+        lastResult
+      };
+
+      await set(ref(db, `rooms/${gamePin}`), updatedGame);
+      setGameState(updatedGame);
+    } catch (err) {
+      console.error('Turn timeout error:', err);
+      setError('Timeout error: ' + err.message);
+    }
+  };
+
+  useEffect(() => {
+    if (!playerId || playerId !== gameState?.host) return;
+
+    const id = setInterval(() => {
+      const gs = gameStateRef.current;
+      if (!gs?.started || gs?.winner || !gs.turnStartedAt) return;
+      if (playerId !== gs.host) return;
+
+      const limitSeconds = gs.turnTimeSeconds || DEFAULT_TURN_TIME_SECONDS;
+      const remainingMs = (limitSeconds * 1000) - (Date.now() - gs.turnStartedAt);
+      if (remainingMs > 0) return;
+      if (timeoutInProgressRef.current) return;
+
+      timeoutInProgressRef.current = true;
+      handleTurnTimeout().finally(() => {
+        timeoutInProgressRef.current = false;
+      });
+    }, 500);
+
+    return () => clearInterval(id);
+  }, [playerId, gameState?.host]);
+
+  useEffect(() => {
+    if (!gameState?.started || gameState?.winner) return;
+    if (playerId !== gameState.host) return;
+
+    const activePlayers = gameState.players.filter(p => !p.eliminated);
+    const currentActive = activePlayers[gameState.currentPlayer];
+    if (!currentActive?.isBot) return;
+
+    const turnKey = `${gameState.turnStartedAt || 0}:${currentActive.id}`;
+    if (botActionRef.current?.turnKey === turnKey) return;
+
+    if (botActionRef.current?.timeoutId) {
+      clearTimeout(botActionRef.current.timeoutId);
+    }
+
+    const delay = 900 + Math.random() * 1100;
+    const timeoutId = setTimeout(() => {
+      performBotTurn(currentActive);
+    }, delay);
+
+    botActionRef.current = { turnKey, timeoutId };
+  }, [gameState, playerId]);
+
+  useEffect(() => {
+    return () => {
+      if (botActionRef.current?.timeoutId) {
+        clearTimeout(botActionRef.current.timeoutId);
+      }
+    };
+  }, []);
 
   const copyPIN = () => {
     navigator.clipboard.writeText(gamePin);
@@ -879,8 +1314,8 @@ export default function BullshitPoker() {
           backgroundColor: '#ffffff',
           boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)'
         }}
-        initial={{ rotateY: 180, scale: 0.8, opacity: 0 }}
-        animate={{ rotateY: 0, scale: 1, opacity: 1 }}
+        initial={{ scale: 0.9, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
         transition={{ 
           type: "spring", 
           stiffness: 260, 
@@ -1059,7 +1494,7 @@ export default function BullshitPoker() {
                 setSelectedRank2(null);
                 setSelectedSuit(null);
               }}
-              className="w-full p-3 border-2 border-gray-300 rounded-lg bg-white text-gray-800 font-bold focus:border-blue-500 outline-none appearance-none"
+              className="w-full appearance-none select-field"
             >
               <option value="" disabled>Select a hand...</option>
               {HAND_RANKINGS.map(h => (
@@ -1086,7 +1521,7 @@ export default function BullshitPoker() {
                   <select
                     value={selectedRank || ''}
                     onChange={(e) => setSelectedRank(e.target.value)}
-                    className="w-full p-3 border-2 border-gray-300 rounded-lg bg-white text-gray-800 font-bold focus:border-indigo-500 outline-none"
+                    className="w-full select-field"
                   >
                      <option value="" disabled>Select Rank</option>
                      {RANKS.map(r => (
@@ -1104,7 +1539,7 @@ export default function BullshitPoker() {
                     <select
                       value={selectedRank2 || ''}
                       onChange={(e) => setSelectedRank2(e.target.value)}
-                      className="w-full p-3 border-2 border-gray-300 rounded-lg bg-white text-gray-800 font-bold focus:border-purple-500 outline-none"
+                      className="w-full select-field"
                     >
                        <option value="" disabled>Select Rank</option>
                        {RANKS.map(r => (
@@ -1122,7 +1557,7 @@ export default function BullshitPoker() {
                   <select
                     value={selectedSuit || ''}
                     onChange={(e) => setSelectedSuit(e.target.value)}
-                    className={`w-full p-3 border-2 border-gray-300 rounded-lg bg-white font-bold focus:border-blue-500 outline-none ${
+                    className={`w-full select-field ${
                        selectedSuit === '♥' || selectedSuit === '♦' ? 'text-red-600' : 'text-gray-800'
                     }`}
                   >
@@ -1145,7 +1580,7 @@ export default function BullshitPoker() {
                   ((selectedHand.name === 'Two Pair' || selectedHand.name === 'Full House') && !selectedRank2) || 
                   ((['Flush', 'Straight Flush', 'Royal Flush'].includes(selectedHand.name)) && !selectedSuit)
                 }
-                className="w-full py-3 bg-blue-600 text-white rounded-xl font-bold text-lg shadow-lg hover:bg-blue-700 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed mt-4"
+                className="w-full py-3 rounded-xl font-bold text-lg shadow-lg active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed mt-4 btn-primary"
                 whileHover={{ scale: 1.02 }}
             >
                 📢 Announce Claim
@@ -1191,7 +1626,78 @@ export default function BullshitPoker() {
     );
   }
 
-  function PlayerAvatar({ player, position, isActive, isStarter, delay = 0, currentClaim, formatClaim, isMe, onClick }) {
+  function TurnTimerRing({ active, turnStartedAt, totalSeconds }) {
+    const safeTotal = Math.max(1, totalSeconds);
+    const [secondsLeft, setSecondsLeft] = useState(active ? safeTotal : safeTotal);
+
+    useEffect(() => {
+      if (!active || !turnStartedAt) {
+        setSecondsLeft(safeTotal);
+        return;
+      }
+
+      const tick = () => {
+        const elapsedMs = Date.now() - turnStartedAt;
+        const remaining = Math.max(0, Math.ceil((safeTotal * 1000 - elapsedMs) / 1000));
+        setSecondsLeft(remaining);
+      };
+
+      tick();
+      const id = setInterval(tick, 250);
+      return () => clearInterval(id);
+    }, [active, turnStartedAt, safeTotal]);
+
+    const safeLeft = Math.max(0, Math.min(secondsLeft, safeTotal));
+    const progress = safeLeft / safeTotal;
+    const degrees = Math.round(progress * 360);
+    const danger = safeLeft <= 10;
+
+    return (
+      <div
+        className={`timer-ring ${active ? 'timer-active' : 'timer-idle'} ${danger ? 'timer-danger' : ''}`}
+        style={{ '--timer-deg': `${degrees}deg` }}
+        title={active ? `${formatTime(safeLeft)} remaining` : `Turn limit ${formatTime(safeTotal)}`}
+      >
+        <div className="timer-core">
+          <span className="timer-text">{active ? formatTime(safeLeft) : ''}</span>
+        </div>
+      </div>
+    );
+  }
+
+  function TurnTimerPill({ active, turnStartedAt, totalSeconds }) {
+    const safeTotal = Math.max(1, totalSeconds);
+    const [secondsLeft, setSecondsLeft] = useState(safeTotal);
+
+    useEffect(() => {
+      if (!active || !turnStartedAt) {
+        setSecondsLeft(safeTotal);
+        return;
+      }
+
+      const tick = () => {
+        const elapsedMs = Date.now() - turnStartedAt;
+        const remaining = Math.max(0, Math.ceil((safeTotal * 1000 - elapsedMs) / 1000));
+        setSecondsLeft(remaining);
+      };
+
+      tick();
+      const id = setInterval(tick, 250);
+      return () => clearInterval(id);
+    }, [active, turnStartedAt, safeTotal]);
+
+    const danger = secondsLeft <= 10;
+
+    return (
+      <div className={`turn-timer-pill ${danger ? 'turn-timer-danger' : ''}`}>
+        <span className="turn-timer-label">Turn</span>
+        <span className="turn-timer-value">{formatTime(secondsLeft)}</span>
+        <span className="turn-timer-total">/ {formatTime(safeTotal)}</span>
+      </div>
+    );
+  }
+
+  function PlayerAvatar({ player, position, isActive, isStarter, delay = 0, currentClaim, formatClaim, isMe, onClick, turnStartedAt, turnTotalSeconds }) {
     return (
       <div
         className="absolute"
@@ -1295,6 +1801,13 @@ export default function BullshitPoker() {
               className="w-full h-full object-cover" 
              />
            </motion.div>
+           <div className="absolute" style={{ left: '100%', top: '50%', transform: 'translate(10px, -50%)' }}>
+             <TurnTimerRing
+               active={isActive}
+               turnStartedAt={turnStartedAt}
+               totalSeconds={turnTotalSeconds}
+             />
+           </div>
            {/* ME Badge Removed */}
            {player.eliminated && (
              <div className="absolute inset-0 flex items-center justify-center bg-black/60 rounded-full">
@@ -1362,9 +1875,14 @@ export default function BullshitPoker() {
   function RoundResultModal({ result, allCards, onClose }) {
     if (!result) return null;
     
+    const isTimeout = result.timeout === true;
     const wasHonest = result.wasLying === false || result.wasCorrect === true;
-    const bgColor = wasHonest ? 'rgba(22, 163, 74, 0.95)' : 'rgba(220, 38, 38, 0.95)';
-    const borderColor = wasHonest ? '#16a34a' : '#dc2626';
+    const bgColor = isTimeout
+      ? 'rgba(234, 88, 12, 0.95)'
+      : (wasHonest ? 'rgba(22, 163, 74, 0.95)' : 'rgba(220, 38, 38, 0.95)');
+    const borderColor = isTimeout
+      ? '#ea580c'
+      : (wasHonest ? '#16a34a' : '#dc2626');
     
     // Sort cards by rank first (A to 2), then by suit
     const sortedCards = allCards ? [...allCards].sort((a, b) => {
@@ -1398,9 +1916,11 @@ export default function BullshitPoker() {
               style={{ backgroundColor: bgColor, borderBottom: `4px solid ${borderColor}` }}
             >
               <div className="text-6xl font-bold mb-2">
-                {wasHonest ? '✅ HONEST!' : '🚨 BULLSHIT!'}
+                {isTimeout ? '⏱ TIMEOUT' : (wasHonest ? '✅ HONEST!' : '🚨 BULLSHIT!')}
               </div>
-              <div className="text-xl font-semibold">Round Complete</div>
+              <div className="text-xl font-semibold">
+                {isTimeout ? 'Turn Time Expired' : 'Round Complete'}
+              </div>
             </div>
 
             {/* Body with cards and claim */}
@@ -1408,12 +1928,18 @@ export default function BullshitPoker() {
               {/* The Claim */}
               <div>
                 <div className="text-sm font-semibold text-gray-600 mb-1">Final Claim:</div>
-                <div className="text-xl text-gray-900">
-                  {formatClaim(result.claim || result.endingClaim)}
-                </div>
-                <div className="text-sm text-gray-600 mt-1">
-                  by {(result.claim || result.endingClaim)?.playerName}
-                </div>
+                {result.claim || result.endingClaim ? (
+                  <>
+                    <div className="text-xl text-gray-900">
+                      {formatClaim(result.claim || result.endingClaim)}
+                    </div>
+                    <div className="text-sm text-gray-600 mt-1">
+                      by {(result.claim || result.endingClaim)?.playerName}
+                    </div>
+                  </>
+                ) : (
+                  <div className="text-sm text-gray-500">No claim recorded (timer expired).</div>
+                )}
               </div>
 
               {/* All Cards in Round - Sorted by Rank */}
@@ -1435,6 +1961,9 @@ export default function BullshitPoker() {
                   {result.winner && <span className="text-green-600">{result.winner}</span>}
                   {result.loser ? ' gets +1 card' : ' wins the round!'}
                 </div>
+                {isTimeout && (
+                  <div className="text-xs text-gray-600 mt-2">Reason: {result.reason || 'Time expired'}</div>
+                )}
               </div>
 
               {/* Close Button */}
@@ -1456,17 +1985,17 @@ export default function BullshitPoker() {
   if (showRules) {
     return (
       <motion.div 
-        className="min-h-screen bg-gray-900 p-4 flex items-center justify-center"
+        className="screen-shell"
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
       >
         <motion.div 
-          className="bg-white rounded-lg p-6 max-w-2xl"
+          className="panel p-6 max-w-2xl"
           initial={{ scale: 0.8, y: 50 }}
           animate={{ scale: 1, y: 0 }}
           transition={{ type: "spring", stiffness: 200 }}
         >
-          <h1 className="text-3xl font-extrabold mb-6 text-center text-gray-900 border-b pb-4">📜 How to Play Bullshit Poker</h1>
+          <h1 className="text-3xl font-extrabold mb-6 text-center text-gray-900 border-b pb-4 app-title">📜 How to Play Bullshit Poker</h1>
           
           <div className="space-y-6 text-gray-700 max-h-[60vh] overflow-y-auto pr-2">
             
@@ -1506,6 +2035,13 @@ export default function BullshitPoker() {
             </section>
 
             <section>
+              <h3 className="font-bold text-lg text-amber-600 mb-2">⏱️ Turn Timer</h3>
+              <p className="text-sm leading-relaxed">
+                Each turn has a time limit. If the timer hits zero, that player gets +1 card and the round ends immediately.
+              </p>
+            </section>
+
+            <section>
               <h3 className="font-bold text-lg text-purple-600 mb-2">📈 Hand Rankings (Low to High)</h3>
               <div className="grid grid-cols-2 gap-2 text-xs bg-gray-50 p-3 rounded border">
                 <div>1. High Card</div>
@@ -1537,15 +2073,15 @@ export default function BullshitPoker() {
 
   if (screen === 'home') {
     return (
-      <div className="min-h-screen bg-gray-900 flex items-center justify-center p-4">
+      <div className="screen-shell">
         <motion.div 
-          className="bg-white rounded-lg p-8 max-w-md w-full"
+          className="panel p-8 max-w-md w-full"
           initial={{ scale: 0.9, opacity: 0 }}
           animate={{ scale: 1, opacity: 1 }}
           transition={{ type: "spring", stiffness: 200 }}
         >
           <motion.h1 
-            className="text-3xl font-bold text-center mb-2"
+            className="text-3xl font-bold text-center mb-2 app-title"
             initial={{ y: -20, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
             transition={{ delay: 0.2 }}
@@ -1553,7 +2089,7 @@ export default function BullshitPoker() {
             Bullshit Poker
           </motion.h1>
           <motion.p 
-            className="text-center text-gray-600 mb-6"
+            className="text-center mb-6 app-subtitle"
             initial={{ y: -20, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
             transition={{ delay: 0.3 }}
@@ -1563,7 +2099,7 @@ export default function BullshitPoker() {
           
           <motion.button 
             onClick={() => setShowRules(true)} 
-            className="w-full mb-4 bg-gray-200 py-2 rounded font-medium"
+            className="w-full mb-4 py-2 rounded font-medium btn-ghost"
             whileHover={{ scale: 1.02, backgroundColor: '#e5e7eb' }}
             whileTap={{ scale: 0.98 }}
             initial={{ y: 20, opacity: 0 }}
@@ -1578,11 +2114,33 @@ export default function BullshitPoker() {
             placeholder="Enter your name"
             value={playerName}
             onChange={(e) => setPlayerName(e.target.value)}
-            className="w-full p-3 border-2 rounded mb-4 focus:border-blue-500 outline-none"
+            className="w-full mb-4 outline-none input-field"
             initial={{ y: 20, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
             transition={{ delay: 0.5 }}
           />
+
+          <div className="mb-4">
+            <label className="text-sm font-semibold text-gray-700 mb-2 block">Turn Time Limit</label>
+            <div className="relative">
+              <select
+                value={turnTimeSeconds}
+                onChange={(e) => updateTurnTime(e.target.value)}
+                className="w-full appearance-none select-field"
+              >
+                <option value={30}>30 seconds</option>
+                <option value={60}>1 minute</option>
+                <option value={90}>1.5 minutes</option>
+                <option value={120}>2 minutes (default)</option>
+                <option value={180}>3 minutes</option>
+                <option value={240}>4 minutes</option>
+              </select>
+              <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-3 text-gray-700">
+                <svg className="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/></svg>
+              </div>
+            </div>
+            <div className="text-xs text-gray-500 mt-2">If the timer hits zero, the player gets +1 card and the round ends.</div>
+          </div>
           
           <AnimatePresence>
             {error && (
@@ -1601,8 +2159,8 @@ export default function BullshitPoker() {
 
           <motion.button 
             onClick={createGame} 
-            className="w-full bg-blue-600 text-white py-3 rounded mb-3 font-bold"
-            whileHover={{ scale: 1.02, backgroundColor: '#2563eb' }}
+            className="w-full py-3 rounded mb-3 font-bold btn-primary"
+            whileHover={{ scale: 1.02 }}
             whileTap={{ scale: 0.98 }}
             initial={{ y: 20, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
@@ -1622,7 +2180,7 @@ export default function BullshitPoker() {
             placeholder="Enter Game PIN"
             value={gamePin}
             onChange={(e) => setGamePin(e.target.value.toUpperCase())}
-            className="w-full p-3 border-2 rounded mb-4 focus:border-blue-500 outline-none"
+            className="w-full mb-4 outline-none input-field"
             transition={{ delay: 0.75 }}
           />
 
@@ -1630,7 +2188,7 @@ export default function BullshitPoker() {
 
           <motion.button 
             onClick={joinGame} 
-            className="w-full bg-gray-800 text-white py-3 rounded font-bold"
+            className="w-full py-3 rounded font-bold btn-secondary"
             whileHover={{ scale: 1.02, backgroundColor: '#1f2937' }}
             whileTap={{ scale: 0.98 }}
             initial={{ y: 20, opacity: 0 }}
@@ -1646,15 +2204,16 @@ export default function BullshitPoker() {
 
   if (screen === 'lobby' && gameState && !gameState.started) {
     const isHost = playerId === gameState.host;
+    const turnSeconds = gameState.turnTimeSeconds || DEFAULT_TURN_TIME_SECONDS;
     
     return (
-      <div className="min-h-screen bg-gray-900 flex items-center justify-center p-4">
+      <div className="screen-shell">
         <motion.div 
-          className="bg-white rounded-lg p-8 max-w-md w-full"
+          className="panel p-8 max-w-md w-full"
           initial={{ scale: 0.9, opacity: 0 }}
           animate={{ scale: 1, opacity: 1 }}
         >
-          <h2 className="text-2xl font-bold text-center mb-4">Game Lobby</h2>
+          <h2 className="text-2xl font-bold text-center mb-4 app-title">Game Lobby</h2>
           
           <div className="bg-blue-50 p-4 rounded mb-6 flex items-center justify-between">
             <div>
@@ -1678,6 +2237,32 @@ export default function BullshitPoker() {
                 </motion.div>
               </AnimatePresence>
             </motion.button>
+          </div>
+
+          <div className="bg-gray-50 p-4 rounded mb-6">
+            <div className="text-sm text-gray-600 mb-2">Turn Time Limit</div>
+            {isHost ? (
+              <div className="relative">
+                <select
+                  value={turnSeconds}
+                  onChange={(e) => updateTurnTime(e.target.value)}
+                  className="w-full appearance-none select-field"
+                >
+                  <option value={30}>30 seconds</option>
+                  <option value={60}>1 minute</option>
+                  <option value={90}>1.5 minutes</option>
+                  <option value={120}>2 minutes (default)</option>
+                  <option value={180}>3 minutes</option>
+                  <option value={240}>4 minutes</option>
+                </select>
+                <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-3 text-gray-700">
+                  <svg className="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/></svg>
+                </div>
+              </div>
+            ) : (
+              <div className="text-lg font-bold text-gray-900">{formatTime(turnSeconds)} per turn</div>
+            )}
+            <div className="text-xs text-gray-500 mt-2">Timer expiry gives +1 card and ends the round.</div>
           </div>
           
           <div className="mb-6">
@@ -1704,18 +2289,38 @@ export default function BullshitPoker() {
                     </div>
                     <div>
                       <span className="font-bold text-gray-800">{player.name}</span>
+                      {player.isBot && <span className="ml-2 text-xs bg-gray-200 text-gray-700 px-2 py-0.5 rounded-full font-semibold">BOT</span>}
                       {player.id === gameState.host && <span className="ml-2 text-yellow-500 text-sm">⭐ HOST</span>}
                     </div>
+                    {isHost && player.isBot && (
+                      <button
+                        onClick={() => removeBot(player.id)}
+                        className="ml-auto text-xs bg-red-100 text-red-700 px-2 py-1 rounded font-semibold hover:bg-red-200"
+                      >
+                        Remove
+                      </button>
+                    )}
                   </div>
                 </motion.div>
               ))}
             </AnimatePresence>
           </div>
+
+          {isHost && gameState.players.length < 10 && (
+            <motion.button 
+              onClick={addBot} 
+              className="w-full py-2 rounded mb-3 font-bold btn-secondary"
+              whileHover={{ scale: 1.02 }}
+              whileTap={{ scale: 0.98 }}
+            >
+              Add Bot
+            </motion.button>
+          )}
           
           {isHost && gameState.players.length >= 2 && (
             <motion.button 
               onClick={startGame} 
-              className="w-full bg-blue-600 text-white py-3 rounded mb-3 font-bold"
+              className="w-full py-3 rounded mb-3 font-bold btn-primary"
               whileHover={{ scale: 1.02 }}
               whileTap={{ scale: 0.98 }}
               initial={{ scale: 0.9 }}
@@ -1727,7 +2332,7 @@ export default function BullshitPoker() {
           
           <motion.button 
             onClick={resetGame} 
-            className="w-full bg-gray-300 py-2 rounded text-sm"
+            className="w-full py-2 rounded text-sm btn-ghost"
             whileHover={{ backgroundColor: '#d1d5db' }}
             whileTap={{ scale: 0.98 }}
           >
@@ -1745,10 +2350,11 @@ export default function BullshitPoker() {
     const isMyTurn = activePlayers[gameState.currentPlayer]?.id === playerId;
     const isStartingPlayer = currentActiveIndex === gameState.startingPlayer;
     const isEndingTurn = isStartingPlayer && isMyTurn && gameState.currentClaim;
+    const turnTimeLimitSeconds = gameState.turnTimeSeconds || DEFAULT_TURN_TIME_SECONDS;
 
     if (gameState.winner) {
       return (
-        <div className="min-h-screen bg-gray-900 flex items-center justify-center p-4">
+        <div className="screen-shell">
           <Confetti
             width={window.innerWidth}
             height={window.innerHeight}
@@ -1756,7 +2362,7 @@ export default function BullshitPoker() {
             numberOfPieces={500}
           />
           <motion.div 
-            className="bg-white rounded-lg p-8 max-w-md w-full text-center"
+            className="panel p-8 max-w-md w-full text-center"
             initial={{ scale: 0, rotate: -180 }}
             animate={{ scale: 1, rotate: 0 }}
             transition={{ type: "spring", stiffness: 200, damping: 15 }}
@@ -1825,6 +2431,11 @@ export default function BullshitPoker() {
         >
           <h1 className="text-xl font-bold">Bullshit Poker <span className="text-sm font-normal ml-2 bg-gray-100 px-2 py-1 rounded">PIN: {gamePin}</span></h1>
           <div className="flex items-center gap-3">
+            <TurnTimerPill
+              active={Boolean(gameState.turnStartedAt)}
+              turnStartedAt={gameState.turnStartedAt}
+              totalSeconds={turnTimeLimitSeconds}
+            />
             {gameState.lastResult && (
               <motion.button 
                 onClick={() => setShowRoundResult(true)} 
@@ -1972,6 +2583,8 @@ export default function BullshitPoker() {
                       currentClaim={claimDisplay}
                       formatClaim={formatClaim}
                       isMe={p.id === player.id}
+                      turnStartedAt={gameState.turnStartedAt}
+                      turnTotalSeconds={turnTimeLimitSeconds}
                       // onClick={() => p.id === player.id && setShowAvatarPopup(true)}
                     />
                   );
@@ -2003,7 +2616,10 @@ export default function BullshitPoker() {
                        {/* Make Claim Button */}
                        {isMyTurn && (
                          <motion.button
-                           onClick={() => setShowClaimModal(true)}
+                           onClick={() => {
+                             setError('');
+                             setShowClaimModal(true);
+                           }}
                            className="bg-blue-600 text-white px-8 py-3 rounded-full font-bold text-lg shadow-lg hover:bg-blue-500 border-2 border-blue-400"
                            whileHover={{ scale: 1.05 }}
                            whileTap={{ scale: 0.95 }}
@@ -2132,4 +2748,3 @@ export default function BullshitPoker() {
 
   return null;
 }
-
